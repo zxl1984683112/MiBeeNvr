@@ -1,0 +1,36 @@
+name: Build arm64 (fix)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        run: cd web && npm ci && npm run build && cp -r dist/* ../internal/ui/static/
+
+      - name: Build arm64 binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+            -ldflags="-s -w -X main.appVersion=v0.12.0-fix2" \
+            -o mibee-nvr-arm64 ./cmd/mibee-nvr/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: mibee-nvr-arm64
+          path: mibee-nvr-arm64
