@@ -832,8 +832,47 @@ func (c *Cloud) sendTicket() error {
 	}
 }
 
+// authCookies returns the cookie set shared by the login/verify flow:
+// sdkVersion, deviceId, identity_session and ick. identity_session is what
+// Xiaomi requires when following the post-verify redirect chain
+// (identity/result/check -> serviceLoginAuth2/end). The previous code dropped
+// these cookies, so the post-verify chain broke and no serviceToken was issued.
+func (c *Cloud) authCookies() string {
+	parts := []string{"sdkVersion=3.8.6"}
+	if c.auth != nil {
+		if d := c.auth["deviceId"]; d != "" {
+			parts = append(parts, "deviceId="+d)
+		}
+		if s := c.auth["identity_session"]; s != "" {
+			parts = append(parts, "identity_session="+s)
+		}
+		if s := c.auth["ick"]; s != "" {
+			parts = append(parts, "ick="+s)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// miHomeUA returns the Mi Home Android app User-Agent that account.xiaomi.com
+// expects (identical to ha-xiaomi-miot).
+func (c *Cloud) miHomeUA() string {
+	deviceID := ""
+	if c.auth != nil {
+		deviceID = c.auth["deviceId"]
+	}
+	return fmt.Sprintf("Android-7.1.1-1.0.0-ONEPLUS A3010-136-%s APP/xiaomi.smarthome APPV/62830", deviceID)
+}
+
 func (c *Cloud) finishAuth(location string) error {
-	res, err := c.client.Get(location)
+	req, err := http.NewRequest(http.MethodGet, location, nil)
+	if err != nil {
+		return err
+	}
+	if ck := c.authCookies(); ck != "" {
+		req.Header.Set("Cookie", ck)
+	}
+	req.Header.Set("User-Agent", c.miHomeUA())
+	res, err := c.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -893,10 +932,18 @@ func (c *Cloud) loginWithVerify(ticket string) error {
 		return errors.New("xiaomi: no pending verification session")
 	}
 
+	// POST body carries _flag/ticket/trust/_json (aligned with ha-xiaomi-miot).
+	form := url.Values{
+		"_flag":  {c.auth["flag"]},
+		"ticket": {ticket},
+		"trust":  {"false"},
+		"_json":  {"true"},
+	}
 	req := cloudRequest{
 		Method:     "POST",
 		URL:        "https://account.xiaomi.com/identity/auth/verify" + c.verifyName(),
-		RawParams:  "_flag=" + c.auth["flag"] + "&ticket=" + ticket + "&trust=false&_json=true",
+		RawParams:  "_dc=" + strconv.FormatInt(time.Now().UnixMilli(), 10),
+		Body:       form,
 		RawCookies: "identity_session=" + c.auth["identity_session"],
 	}.Encode()
 
@@ -906,15 +953,19 @@ func (c *Cloud) loginWithVerify(ticket string) error {
 	}
 
 	var v1 struct {
+		Code     int    `json:"code"`
 		Location string `json:"location"`
 	}
 	body, err := readLoginResponse(res.Body, &v1)
 	if err != nil {
 		return err
 	}
-	if v1.Location == "" {
+	if v1.Code != 0 || v1.Location == "" {
+		cloudLogger.Warn("xiaomi verify rejected", "code", v1.Code, "body", string(body))
 		return fmt.Errorf("xiaomi: verification failed: %s", body)
 	}
+
+	cloudLogger.Info("xiaomi verify accepted, following redirect chain", "location", v1.Location)
 
 	if err := c.finishAuth(v1.Location); err != nil {
 		return err
