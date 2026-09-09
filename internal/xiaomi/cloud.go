@@ -1036,14 +1036,12 @@ func (c *Cloud) loginWithVerify(ticket string) error {
 
 	cloudLogger.Info("xiaomi verify accepted, following redirect chain", "location", v1.Location)
 
-	if err := c.finishAuth(v1.Location); err != nil {
-		return err
-	}
-
-	// 修复：二步验证通过后，identity/auth/verify 响应只有 location，不含
-	// ssecurity/passToken。必须用已通过验证的 cookie 重新请求 serviceLogin
-	// 才能拿到完整凭证（参考 ha-xiaomi-miot：verify 后需重新走 _login_step1）。
-	return c.refreshAfterVerify()
+	// finishAuth follows the identity/result/check -> serviceLoginAuth2/end
+	// chain with a cookie jar and captures serviceToken/passToken/ssecurity
+	// from cookies + Extension-Pragma. This already yields the full credential
+	// set, so return its result directly. (A previous attempt re-queried
+	// serviceLogin here, which Xiaomi rejected with code=70016.)
+	return c.finishAuth(v1.Location)
 }
 
 // refreshAfterVerify re-fetches ssecurity and passToken after two-step
