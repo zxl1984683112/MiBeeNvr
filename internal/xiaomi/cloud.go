@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strconv"
 	"strings"
@@ -862,23 +863,47 @@ func (c *Cloud) miHomeUA() string {
 }
 
 func (c *Cloud) finishAuth(location string) error {
-	req, err := http.NewRequest(http.MethodGet, location, nil)
+	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return err
 	}
+	// Seed the jar with the cookies we already hold (deviceId, identity_session,
+	// ick, sdkVersion, plus any userId/cUserId/serviceToken already collected)
+	// so the post-verify redirect chain carries them on every hop.
 	if ck := c.authCookies(); ck != "" {
-		req.Header.Set("Cookie", ck)
+		seedCookies(jar, "https://account.xiaomi.com", ck)
 	}
-	req.Header.Set("User-Agent", c.miHomeUA())
-	res, err := c.client.Do(req)
-	if err != nil {
-		return err
+	if c.cookies != "" {
+		seedCookies(jar, "https://account.xiaomi.com", c.cookies)
 	}
-	defer res.Body.Close()
+
+	// No automatic redirects: Go's http.Client does NOT re-send manually-set
+	// Cookie headers across redirect hops. We follow the chain manually with a
+	// jar so every hop carries the cookies, and we can read each hop's
+	// Extension-Pragma (the ssecurity carrier).
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Jar:     jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
 	var cUserID, serviceToken string
 
-	for res != nil {
+	next := location
+	for i := 0; i < 10 && next != ""; i++ {
+		req, err := http.NewRequest(http.MethodGet, next, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", c.miHomeUA())
+
+		res, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+
 		for _, cookie := range res.Cookies() {
 			switch cookie.Name {
 			case "userId":
@@ -896,18 +921,64 @@ func (c *Cloud) finishAuth(location string) error {
 			var v1 struct {
 				Ssecurity []byte `json:"ssecurity"`
 			}
-			if err = json.Unmarshal([]byte(s), &v1); err != nil {
-				return err
+			if err = json.Unmarshal([]byte(s), &v1); err == nil && len(v1.Ssecurity) > 0 {
+				c.ssecurity = v1.Ssecurity
 			}
-			c.ssecurity = v1.Ssecurity
 		}
 
-		res = res.Request.Response
+		status := res.StatusCode
+		res.Body.Close()
+
+		cloudLogger.Info("xiaomi finishAuth hop",
+			"hop", i, "status", status,
+			"has_service_token", serviceToken != "",
+			"has_ssecurity", len(c.ssecurity) > 0)
+
+		loc := res.Header.Get("Location")
+		if loc == "" {
+			break
+		}
+		if u, err := res.Request.URL.Parse(loc); err == nil {
+			next = u.String()
+		} else {
+			next = loc
+		}
 	}
+
+	cloudLogger.Info("xiaomi finishAuth chain done",
+		"user_id", c.userID,
+		"has_service_token", serviceToken != "",
+		"has_pass_token", c.passToken != "",
+		"has_ssecurity", len(c.ssecurity) > 0)
 
 	c.cookies = fmt.Sprintf("userId=%s; cUserId=%s; serviceToken=%s", c.userID, cUserID, serviceToken)
 
 	return nil
+}
+
+// seedCookies parses a "k=v; k2=v2" cookie header string and adds each cookie
+// to the jar for the given base URL.
+func seedCookies(jar http.CookieJar, baseURL, cookieHeader string) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return
+	}
+	var cookies []*http.Cookie
+	for _, part := range strings.Split(cookieHeader, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		ck := &http.Cookie{Name: kv[0], Path: "/"}
+		if len(kv) == 2 {
+			ck.Value = kv[1]
+		}
+		cookies = append(cookies, ck)
+	}
+	if len(cookies) > 0 {
+		jar.SetCookies(u, cookies)
+	}
 }
 
 func (c *Cloud) loginWithCaptcha(captcha string) error {
@@ -1017,10 +1088,17 @@ func (c *Cloud) refreshAfterVerify() error {
 		PassToken string `json:"passToken"`
 		Location  string `json:"location"`
 	}
-	if _, err := readLoginResponse(res.Body, &v1); err != nil {
+	body, err := readLoginResponse(res.Body, &v1)
+	if err != nil {
 		return err
 	}
+	cloudLogger.Info("xiaomi post-verify serviceLogin",
+		"code", v1.Code,
+		"has_ssecurity", len(v1.Ssecurity) > 0,
+		"has_pass_token", v1.PassToken != "",
+		"has_location", v1.Location != "")
 	if v1.Code != 0 {
+		cloudLogger.Warn("xiaomi post-verify serviceLogin rejected", "code", v1.Code, "body", string(body))
 		return fmt.Errorf("xiaomi: post-verify serviceLogin failed: code=%d", v1.Code)
 	}
 	if len(v1.Ssecurity) > 0 {
