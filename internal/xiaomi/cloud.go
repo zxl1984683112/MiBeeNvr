@@ -550,7 +550,8 @@ func (c *Cloud) Login(username, password string) error {
 		"qs":       {v1.Qs},
 		"user":     {username},
 	}
-	cookies := "deviceId=" + randString(16)
+	deviceID := randString(16)
+	cookies := "deviceId=" + deviceID
 
 	req := cloudRequest{
 		Method:     "POST",
@@ -580,6 +581,7 @@ func (c *Cloud) Login(username, password string) error {
 	c.auth = map[string]string{
 		"username": username,
 		"password": password,
+		"deviceId": deviceID,
 	}
 
 	if v2.CaptchaURL != "" {
@@ -914,7 +916,74 @@ func (c *Cloud) loginWithVerify(ticket string) error {
 		return fmt.Errorf("xiaomi: verification failed: %s", body)
 	}
 
-	return c.finishAuth(v1.Location)
+	if err := c.finishAuth(v1.Location); err != nil {
+		return err
+	}
+
+	// 修复：二步验证通过后，identity/auth/verify 响应只有 location，不含
+	// ssecurity/passToken。必须用已通过验证的 cookie 重新请求 serviceLogin
+	// 才能拿到完整凭证（参考 ha-xiaomi-miot：verify 后需重新走 _login_step1）。
+	return c.refreshAfterVerify()
+}
+
+// refreshAfterVerify re-fetches ssecurity and passToken after two-step
+// verification succeeds. The identity/auth/verify response only carries a
+// `location`; the real credentials are issued by re-querying serviceLogin
+// with the now-authenticated cookies. We must send the same cookie set and
+// the Mi Home App User-Agent that ha-xiaomi-miot uses, otherwise Xiaomi
+// rejects the request and the login flow ends with an empty token.
+func (c *Cloud) refreshAfterVerify() error {
+	req, err := http.NewRequest(http.MethodGet, "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid="+c.sid, nil)
+	if err != nil {
+		return err
+	}
+
+	deviceID := ""
+	var cookies []string
+	cookies = append(cookies, "sdkVersion=3.8.6")
+	if c.auth != nil {
+		deviceID = c.auth["deviceId"]
+		if deviceID != "" {
+			cookies = append(cookies, "deviceId="+deviceID)
+		}
+		if s := c.auth["identity_session"]; s != "" {
+			cookies = append(cookies, "identity_session="+s)
+		}
+	}
+	if c.cookies != "" {
+		cookies = append(cookies, c.cookies)
+	}
+	req.Header.Set("Cookie", strings.Join(cookies, "; "))
+	req.Header.Set("User-Agent", fmt.Sprintf("Android-7.1.1-1.0.0-ONEPLUS A3010-136-%s APP/xiaomi.smarthome APPV/62830", deviceID))
+
+	res, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	var v1 struct {
+		Code      int    `json:"code"`
+		Ssecurity []byte `json:"ssecurity"`
+		PassToken string `json:"passToken"`
+		Location  string `json:"location"`
+	}
+	if _, err := readLoginResponse(res.Body, &v1); err != nil {
+		return err
+	}
+	if v1.Code != 0 {
+		return fmt.Errorf("xiaomi: post-verify serviceLogin failed: code=%d", v1.Code)
+	}
+	if len(v1.Ssecurity) > 0 {
+		c.ssecurity = v1.Ssecurity
+	}
+	if v1.PassToken != "" {
+		c.passToken = v1.PassToken
+	}
+	if v1.Location != "" {
+		return c.finishAuth(v1.Location)
+	}
+	return nil
 }
 
 // --- Internal helpers ---
