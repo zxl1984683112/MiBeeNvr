@@ -853,14 +853,12 @@ func (c *Cloud) authCookies() string {
 	return strings.Join(parts, "; ")
 }
 
-// miHomeUA returns the Mi Home Android app User-Agent that account.xiaomi.com
-// expects (identical to ha-xiaomi-miot).
+// miHomeUA returns a Xiaomi-Mi-Home-like User-Agent. The previous hardcoded
+// Mi-Home-app UA triggered Xiaomi's risk-control during the post-verify
+// redirect chain (verify accepted, but the chain never issued serviceToken).
+// Use the well-tested extractor UA shape (browser-ish Mi Home UA).
 func (c *Cloud) miHomeUA() string {
-	deviceID := ""
-	if c.auth != nil {
-		deviceID = c.auth["deviceId"]
-	}
-	return fmt.Sprintf("Android-7.1.1-1.0.0-ONEPLUS A3010-136-%s APP/xiaomi.smarthome APPV/62830", deviceID)
+	return "Mozilla/5.0 (iPhone; CPU iPhone OS 14_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) APP/com.xiaomi.mihome APPV/10.5.201"
 }
 
 func (c *Cloud) finishAuth(location string) error {
@@ -1005,7 +1003,7 @@ func (c *Cloud) refreshAfterVerify() error {
 		cookies = append(cookies, c.cookies)
 	}
 	req.Header.Set("Cookie", strings.Join(cookies, "; "))
-	req.Header.Set("User-Agent", fmt.Sprintf("Android-7.1.1-1.0.0-ONEPLUS A3010-136-%s APP/xiaomi.smarthome APPV/62830", deviceID))
+	req.Header.Set("User-Agent", c.miHomeUA())
 
 	res, err := c.client.Do(req)
 	if err != nil {
